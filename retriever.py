@@ -1,40 +1,66 @@
 """
-Finds which saved memories are relevant to the current message.
+Gathers everything the assistant may use for ONE reply, for the person who is
+chatting:
 
-Uses real semantic embeddings (via embeddings.py) so it can match on
-meaning, not just shared words -- "where do I work" now correctly
-matches a saved memory like "interning at Jindal".
+  own            their active memories (all of them when they have few; the most
+                 relevant ones, by meaning, when they have many). Facts that
+                 someone else told us are labelled "told by ...".
+  relationships  who they are linked to ("Aman (friend)")
+  shared         what a LINKED friend has said about THEMSELVES, but only when
+                 this message mentions that friend by name, the friend allows
+                 sharing, and the fact is not sensitive.
 
-If you only have a handful of memories saved, there's no point being
-clever about filtering -- we just include all of them. Filtering only
-kicks in once the list gets long enough that dumping everything would
-bloat the prompt.
+Vectors are stored in the database, so only the question itself is embedded.
 """
-from embeddings import embed, cosine_similarity
-from db import get_all_memories
+from embeddings import embed_one, cosine_similarity
+from db import get_all_memories, list_relationships, get_shareable_memories
+from store import ensure_embeddings
+from people import name_mentioned
 from config import RETRIEVAL_TOP_K, RETRIEVAL_MIN_SCORE, ALWAYS_INCLUDE_THRESHOLD
 
+SHARED_FACTS_PER_FRIEND = 6
 
-def get_relevant_memories(user_id: str, query: str) -> list[str]:
-    memories = get_all_memories(user_id)
-    if not memories:
-        return []
 
-    facts = [m["fact"] for m in memories]
+def _rank(memories: list[dict], query: str, limit: int, min_score: float | None) -> list[dict]:
+    vectors = ensure_embeddings(memories)
+    query_vector = embed_one(query)
+    scored = sorted(
+        ((m, cosine_similarity(query_vector, v)) for m, v in zip(memories, vectors)),
+        key=lambda x: x[1], reverse=True,
+    )
+    if min_score is not None:
+        scored = [(m, s) for m, s in scored if s >= min_score]
+    return [m for m, _ in scored[:limit]]
 
-    # Small memory list -- just include everything, no filtering needed.
-    if len(facts) <= ALWAYS_INCLUDE_THRESHOLD:
-        return facts
 
-    # Larger list -- rank by semantic similarity to the current message.
-    fact_vectors = embed(facts)
-    query_vector = embed([query])[0]
+def build_context(user_id: str, speaker: dict, message: str) -> dict:
+    memories = get_all_memories(user_id, speaker["id"])
+    if len(memories) > ALWAYS_INCLUDE_THRESHOLD:
+        memories = _rank(memories, message, RETRIEVAL_TOP_K, RETRIEVAL_MIN_SCORE)
+    own = [{"fact": m["fact"], "told_by": m.get("told_by_name")} for m in memories]
 
-    scored = [
-        (fact, cosine_similarity(query_vector, vec))
-        for fact, vec in zip(facts, fact_vectors)
-    ]
-    scored.sort(key=lambda x: x[1], reverse=True)
+    links = list_relationships(speaker["id"])
+    relationships: dict[str, list[str]] = {}
+    for r in links:
+        relationships.setdefault(r["name"], []).append(r["relation"])
 
-    relevant = [fact for fact, score in scored if score >= RETRIEVAL_MIN_SCORE]
-    return relevant[:RETRIEVAL_TOP_K]
+    shared, done = [], set()
+    for r in links:
+        if r["other_id"] in done or not r["share_with_friends"] or not name_mentioned(message, r["name"]):
+            continue
+        done.add(r["other_id"])
+        facts = get_shareable_memories(r["other_id"])
+        if len(facts) > SHARED_FACTS_PER_FRIEND:
+            facts = _rank(facts, message, SHARED_FACTS_PER_FRIEND, None)
+        if facts:
+            shared.append({
+                "name": r["name"],
+                "relation": ", ".join(relationships[r["name"]]),
+                "facts": [m["fact"] for m in facts],
+            })
+
+    return {
+        "own": own,
+        "relationships": [(name, ", ".join(rels)) for name, rels in relationships.items()],
+        "shared": shared,
+    }
