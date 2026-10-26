@@ -1,0 +1,14 @@
+# Put this file at  <your project>/.streamlit/config.toml  (next to streamlit_app.py)
+
+[theme]
+base = "light"
+primaryColor = "#007AFF"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F2F2F7"
+textColor = "#1C1C1E"
+
+[client]
+toolbarMode = "minimal"
+
+[browser]
+gatherUsageStats = false
